@@ -7,6 +7,26 @@ from context_providers import source_code_analyzer_server as analyzer
 from context_providers.source_code_analyzer_server import collect_local_source_files
 
 
+def _get_registered_source(monkeypatch, provider_root, entrypoint):
+    monkeypatch.setattr(analyzer, "__file__", str(provider_root / "provider.py"))
+    monkeypatch.setattr(
+        analyzer,
+        "source_registry",
+        {
+            "mcp_servers": [
+                {
+                    "name": "example",
+                    "path": str(entrypoint.relative_to(provider_root)),
+                    "category": "test",
+                    "description": "example server",
+                    "capabilities": ["read"],
+                }
+            ]
+        },
+    )
+    return analyzer.get_source_code(["example"])["source_codes"][0]
+
+
 def test_collects_local_imported_implementation_without_unrelated_files(tmp_path):
     function_dir = tmp_path / "function"
     function_dir.mkdir()
@@ -150,6 +170,65 @@ def test_registry_entrypoint_cannot_escape_provider_root(tmp_path, monkeypatch):
     }
 
 
+def test_file_limit_marks_bundle_incomplete_when_dependencies_remain(tmp_path, monkeypatch):
+    entrypoint = tmp_path / "server.py"
+    entrypoint.write_text(
+        "\n".join(f"import dependency_{index}" for index in range(analyzer.MAX_LOCAL_SOURCE_FILES)),
+        encoding="utf-8",
+    )
+    for index in range(analyzer.MAX_LOCAL_SOURCE_FILES):
+        (tmp_path / f"dependency_{index}.py").write_text(f"VALUE = {index}\n", encoding="utf-8")
+
+    row = _get_registered_source(monkeypatch, tmp_path, entrypoint)
+
+    assert len(row["source_files"]) == analyzer.MAX_LOCAL_SOURCE_FILES
+    assert not any(item["truncated"] for item in row["source_files"])
+    assert row["source_bundle_complete"] is False
+
+
+def test_exact_byte_limit_marks_bundle_incomplete_when_dependency_remains(tmp_path, monkeypatch):
+    entrypoint = tmp_path / "server.py"
+    entrypoint_source = "import dependency\n"
+    entrypoint.write_text(entrypoint_source, encoding="utf-8")
+    (tmp_path / "dependency.py").write_text("VALUE = 1\n", encoding="utf-8")
+    monkeypatch.setattr(analyzer, "MAX_LOCAL_SOURCE_BYTES", len(entrypoint_source.encode("utf-8")))
+
+    row = _get_registered_source(monkeypatch, tmp_path, entrypoint)
+
+    assert [item["path"] for item in row["source_files"]] == ["server.py"]
+    assert row["source_files"][0]["truncated"] is False
+    assert row["source_bundle_complete"] is False
+
+
+def test_source_bundle_limit_counts_utf8_bytes(tmp_path, monkeypatch):
+    entrypoint = tmp_path / "server.py"
+    entrypoint.write_text("import dependency\n", encoding="utf-8")
+    (tmp_path / "dependency.py").write_text(f"VALUE = {'😀' * 100!r}\n", encoding="utf-8")
+    byte_limit = 128
+    monkeypatch.setattr(analyzer, "MAX_LOCAL_SOURCE_BYTES", byte_limit)
+
+    row = _get_registered_source(monkeypatch, tmp_path, entrypoint)
+
+    assert (
+        sum(len(item["source_code"].encode("utf-8")) for item in row["source_files"]) <= byte_limit
+    )
+    assert row["source_files"][-1]["truncated"] is True
+    assert row["source_bundle_complete"] is False
+
+
+def test_valid_non_utf8_dependency_does_not_fail_server_response(tmp_path, monkeypatch):
+    entrypoint = tmp_path / "server.py"
+    entrypoint.write_text("import dependency\n", encoding="utf-8")
+    (tmp_path / "dependency.py").write_bytes(b"# -*- coding: latin-1 -*-\nVALUE = 'caf\xe9'\n")
+
+    row = _get_registered_source(monkeypatch, tmp_path, entrypoint)
+    source_by_path = {item["path"]: item["source_code"] for item in row["source_files"]}
+
+    assert row["status"] == "found"
+    assert row["source_bundle_complete"] is True
+    assert "café" in source_by_path["dependency.py"]
+
+
 def test_benchmark_public_contract_is_unchanged(tmp_path, monkeypatch):
     provider_root = tmp_path / "provider"
     provider_root.mkdir()
@@ -190,8 +269,6 @@ def test_benchmark_public_contract_is_unchanged(tmp_path, monkeypatch):
         set(source_file) == {"path", "source_code", "truncated"}
         for source_file in row["source_files"]
     )
-    assert list(inspect.signature(collect_local_source_files).parameters) == [
-        "entrypoint"
-    ]
+    assert list(inspect.signature(collect_local_source_files).parameters) == ["entrypoint"]
     assert analyzer.MAX_LOCAL_SOURCE_FILES == 24
-    assert analyzer.MAX_LOCAL_SOURCE_CHARS == 240_000
+    assert analyzer.MAX_LOCAL_SOURCE_BYTES == 240_000

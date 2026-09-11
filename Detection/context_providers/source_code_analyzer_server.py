@@ -6,8 +6,10 @@ Provides MCP server source code for reasoning-based threat analysis.
 No pre-analysis or cheating metadata - just clean source code and basic info.
 """
 import ast
+import io
 import logging
 import os
+import tokenize
 from importlib.machinery import (
     BYTECODE_SUFFIXES,
     EXTENSION_SUFFIXES,
@@ -49,7 +51,7 @@ source_registry = load_source_registry()
 
 
 MAX_LOCAL_SOURCE_FILES = 24
-MAX_LOCAL_SOURCE_CHARS = 240_000
+MAX_LOCAL_SOURCE_BYTES = 240_000
 
 
 def _is_within(path: Path, root: Path) -> bool:
@@ -230,7 +232,43 @@ def _local_import_candidates(current: Path, node: ast.AST, root: Path) -> List[P
     return candidates
 
 
-def collect_local_source_files(entrypoint: Path) -> List[Dict[str, Any]]:
+def _read_bounded_python_source(path: Path, max_bytes: int) -> Tuple[str, bool]:
+    """Read at most ``max_bytes`` of Python source, honoring its encoding.
+
+    The returned text is also bounded by its UTF-8 encoded size because that is
+    the representation sent to the model. One extra input byte is read only to
+    determine whether the source was truncated.
+    """
+
+    with path.open("rb") as source_file:
+        raw_source = source_file.read(max_bytes + 1)
+
+    input_truncated = len(raw_source) > max_bytes
+    raw_source = raw_source[:max_bytes]
+    try:
+        encoding, _ = tokenize.detect_encoding(io.BytesIO(raw_source).readline)
+    except SyntaxError:
+        if not input_truncated:
+            raise
+        # A bounded read can split a UTF-8 code point on a very long first
+        # line. In that case the default Python source encoding still applies.
+        encoding = "utf-8"
+
+    source = raw_source.decode(
+        encoding,
+        errors="ignore" if input_truncated else "strict",
+    )
+    utf8_source = source.encode("utf-8")
+    output_truncated = len(utf8_source) > max_bytes
+    if output_truncated:
+        source = utf8_source[:max_bytes].decode("utf-8", errors="ignore")
+
+    return source, input_truncated or output_truncated
+
+
+def _collect_local_source_bundle(
+    entrypoint: Path,
+) -> Tuple[List[Dict[str, Any]], bool]:
     """Collect a bounded, dependency-aware source bundle for one MCP server.
 
     Registry paths are trusted, but import resolution is constrained to the
@@ -239,47 +277,72 @@ def collect_local_source_files(entrypoint: Path) -> List[Dict[str, Any]]:
     """
 
     root = entrypoint.parent.resolve()
-    entrypoint = _resolved_source_file(entrypoint, root)
-    if entrypoint is None:
-        return []
-    pending = [entrypoint]
+    resolved_entrypoint = _resolved_source_file(entrypoint, root)
+    if resolved_entrypoint is None:
+        return [], False
+    pending = [resolved_entrypoint]
     seen = set()
-    files: List[Dict[str, str]] = []
-    total_chars = 0
-    while pending and len(files) < MAX_LOCAL_SOURCE_FILES:
-        path = pending.pop(0)
-        path = _resolved_source_file(path, root)
-        if path is None or path in seen:
+    files: List[Dict[str, Any]] = []
+    total_bytes = 0
+    complete = True
+    while pending:
+        if len(files) >= MAX_LOCAL_SOURCE_FILES:
+            complete = False
+            break
+        remaining = MAX_LOCAL_SOURCE_BYTES - total_bytes
+        if remaining <= 0:
+            complete = False
+            break
+
+        candidate = pending.pop(0)
+        path = _resolved_source_file(candidate, root)
+        if path is None:
+            complete = False
+            continue
+        if path in seen:
             continue
         seen.add(path)
-        source = path.read_text(encoding="utf-8")
-        remaining = MAX_LOCAL_SOURCE_CHARS - total_chars
-        if remaining <= 0:
-            break
-        truncated = len(source) > remaining
-        included = source[:remaining]
-        files.append({
-            "path": str(path.relative_to(root)),
-            "source_code": included,
-            "truncated": truncated,
-        })
-        total_chars += len(included)
+
+        try:
+            included, truncated = _read_bounded_python_source(path, remaining)
+        except (LookupError, OSError, SyntaxError, UnicodeError) as exc:
+            logger.warning("Unable to include Python source %s: %s", path, exc)
+            complete = False
+            continue
+
+        files.append(
+            {
+                "path": str(path.relative_to(root)),
+                "source_code": included,
+                "truncated": truncated,
+            }
+        )
+        total_bytes += len(included.encode("utf-8"))
         if truncated:
+            complete = False
             break
         try:
-            tree = ast.parse(source, filename=str(path))
+            tree = ast.parse(included, filename=str(path))
         except (SyntaxError, ValueError):
             continue
         for node in ast.walk(tree):
             for dependency in _local_import_candidates(path, node, root):
                 if dependency not in seen and dependency not in pending:
                     pending.append(dependency)
+    return files, complete
+
+
+def collect_local_source_files(entrypoint: Path) -> List[Dict[str, Any]]:
+    """Return the source files from the bounded local dependency bundle."""
+
+    files, _ = _collect_local_source_bundle(entrypoint)
     return files
+
 
 @mcp.tool()
 def get_source_code(server_names: List[str]) -> Dict[str, Any]:
     """Get the source code of MCP servers for analysis"""
-    source_codes = []
+    source_codes: List[Dict[str, Any]] = []
 
     for server_name in server_names:
         # Find server in registry
@@ -304,9 +367,11 @@ def get_source_code(server_names: List[str]) -> Dict[str, Any]:
         try:
             resolved_path = _resolved_source_file(full_path, provider_root)
             if resolved_path is not None:
-                with open(resolved_path, 'r') as f:
+                with tokenize.open(resolved_path) as f:
                     source_code = f.read()
-                source_files = collect_local_source_files(resolved_path)
+                source_files, source_bundle_complete = _collect_local_source_bundle(
+                    resolved_path
+                )
 
                 # Provide clean metadata without cheating indicators
                 source_codes.append({
@@ -322,9 +387,7 @@ def get_source_code(server_names: List[str]) -> Dict[str, Any]:
                     "source_code": source_code,
                     "entrypoint": resolved_path.name,
                     "source_files": source_files,
-                    "source_bundle_complete": not any(
-                        item["truncated"] for item in source_files
-                    ),
+                    "source_bundle_complete": source_bundle_complete,
                 })
             else:
                 source_codes.append({
