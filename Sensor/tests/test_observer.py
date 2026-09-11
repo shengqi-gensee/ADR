@@ -52,6 +52,45 @@ class TestAgentObserver:
         assert "CLAUDE" in captured.out
         assert "INGESTION SUMMARY" in captured.out
 
+    def test_display_summary_limits_recent_entries(self, tmp_path, capsys):
+        observer = AgentObserver(output_dir=tmp_path)
+        entries = [
+            AgentEvent(
+                timestamp=datetime(2025, 1, day, tzinfo=timezone.utc),
+                source="claude",
+                session_id=f"session-{day}",
+                hostname="host",
+                username="user",
+                chat_history=[ChatMessage(role="user", content="hello")],
+            )
+            for day in (1, 2, 3)
+        ]
+
+        observer.display_summary(entries, [], limit=2)
+
+        output = capsys.readouterr().out
+        assert "RECENT ENTRIES" in output
+        assert "2025-01-03" in output
+        assert "2025-01-02" in output
+        assert "2025-01-01" not in output
+
+    def test_display_summary_zero_limit_hides_entries(self, tmp_path, capsys):
+        observer = AgentObserver(output_dir=tmp_path)
+        entry = AgentEvent(
+            timestamp=datetime(2025, 1, 1, tzinfo=timezone.utc),
+            source="claude",
+            session_id="session-1",
+            hostname="host",
+            username="user",
+            chat_history=[ChatMessage(role="user", content="hello")],
+        )
+
+        observer.display_summary([entry], [], limit=0)
+
+        output = capsys.readouterr().out
+        assert "INGESTION SUMMARY" in output
+        assert "RECENT ENTRIES" not in output
+
     def test_save_to_file_json(self, tmp_path):
         """Test saving entries as JSON."""
         observer = AgentObserver(output_dir=tmp_path)
