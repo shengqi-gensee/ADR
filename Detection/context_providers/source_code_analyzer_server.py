@@ -6,6 +6,7 @@ Provides MCP server source code for reasoning-based threat analysis.
 No pre-analysis or cheating metadata - just clean source code and basic info.
 """
 import ast
+import codecs
 import io
 import logging
 import os
@@ -232,36 +233,38 @@ def _local_import_candidates(current: Path, node: ast.AST, root: Path) -> List[P
     return candidates
 
 
-def _read_bounded_python_source(path: Path, max_bytes: int) -> Tuple[str, bool]:
-    """Read at most ``max_bytes`` of Python source, honoring its encoding.
+def _decode_bounded_python_source(raw_source: bytes, max_bytes: int) -> Tuple[str, bool]:
+    """Decode a bounded Python source prefix without discarding invalid bytes.
 
     The returned text is also bounded by its UTF-8 encoded size because that is
-    the representation sent to the model. One extra input byte is read only to
-    determine whether the source was truncated.
+    the representation sent to the model. The caller supplies at most one
+    extra input byte to determine whether the source was truncated.
     """
-
-    with path.open("rb") as source_file:
-        raw_source = source_file.read(max_bytes + 1)
 
     input_truncated = len(raw_source) > max_bytes
     raw_source = raw_source[:max_bytes]
-    try:
-        encoding, _ = tokenize.detect_encoding(io.BytesIO(raw_source).readline)
-    except SyntaxError:
-        if not input_truncated:
-            raise
-        # A bounded read can split a UTF-8 code point on a very long first
-        # line. In that case the default Python source encoding still applies.
-        encoding = "utf-8"
+    header = io.BytesIO(raw_source)
 
-    source = raw_source.decode(
-        encoding,
-        errors="ignore" if input_truncated else "strict",
+    def readline() -> bytes:
+        line = header.readline()
+        if input_truncated and line and not line.endswith(b"\n"):
+            # detect_encoding validates header lines as UTF-8. Permit a split
+            # trailing character, but still reject invalid interior bytes.
+            line = codecs.getincrementaldecoder("utf-8")().decode(
+                line, final=False
+            ).encode("utf-8")
+        return line
+
+    encoding, _ = tokenize.detect_encoding(readline)
+    source = codecs.getincrementaldecoder(encoding)().decode(
+        raw_source, final=not input_truncated
     )
     utf8_source = source.encode("utf-8")
     output_truncated = len(utf8_source) > max_bytes
     if output_truncated:
-        source = utf8_source[:max_bytes].decode("utf-8", errors="ignore")
+        source = codecs.getincrementaldecoder("utf-8")().decode(
+            utf8_source[:max_bytes], final=False
+        )
 
     return source, input_truncated or output_truncated
 
@@ -284,12 +287,13 @@ def _collect_local_source_bundle(
     seen = set()
     files: List[Dict[str, Any]] = []
     total_bytes = 0
+    total_read_bytes = 0
     complete = True
     while pending:
-        if len(files) >= MAX_LOCAL_SOURCE_FILES:
+        if len(seen) >= MAX_LOCAL_SOURCE_FILES:
             complete = False
             break
-        remaining = MAX_LOCAL_SOURCE_BYTES - total_bytes
+        remaining = MAX_LOCAL_SOURCE_BYTES - max(total_bytes, total_read_bytes)
         if remaining <= 0:
             complete = False
             break
@@ -304,8 +308,20 @@ def _collect_local_source_bundle(
         seen.add(path)
 
         try:
-            included, truncated = _read_bounded_python_source(path, remaining)
-        except (LookupError, OSError, SyntaxError, UnicodeError) as exc:
+            with path.open("rb") as source_file:
+                raw_source = source_file.read(remaining + 1)
+        except OSError as exc:
+            # A failed read may have consumed input before raising. Conservatively
+            # stop rather than retrying other files with an uncharged budget.
+            logger.warning("Unable to read Python source %s: %s", path, exc)
+            complete = False
+            break
+        # Charge input even when decoding fails. Each attempted file permits
+        # one additional lookahead byte solely for detecting truncation.
+        total_read_bytes += min(len(raw_source), remaining)
+        try:
+            included, truncated = _decode_bounded_python_source(raw_source, remaining)
+        except (LookupError, SyntaxError, UnicodeError) as exc:
             logger.warning("Unable to include Python source %s: %s", path, exc)
             complete = False
             continue

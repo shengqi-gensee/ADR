@@ -2,6 +2,9 @@
 
 import inspect
 from importlib.machinery import EXTENSION_SUFFIXES
+from pathlib import Path
+
+import pytest
 
 from context_providers import source_code_analyzer_server as analyzer
 from context_providers.source_code_analyzer_server import collect_local_source_files
@@ -272,3 +275,100 @@ def test_benchmark_public_contract_is_unchanged(tmp_path, monkeypatch):
     assert list(inspect.signature(collect_local_source_files).parameters) == ["entrypoint"]
     assert analyzer.MAX_LOCAL_SOURCE_FILES == 24
     assert analyzer.MAX_LOCAL_SOURCE_BYTES == 240_000
+
+
+def _record_binary_reads(monkeypatch):
+    opened = []
+    original_open = Path.open
+
+    def recording_open(path, mode="r", *args, **kwargs):
+        if mode == "rb":
+            opened.append(path.name)
+        return original_open(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", recording_open)
+    return opened
+
+
+def test_failed_decodes_count_toward_file_limit(tmp_path, monkeypatch):
+    entrypoint = tmp_path / "server.py"
+    entrypoint.write_text("import bad0, bad1, bad2, bad3\n", encoding="utf-8")
+    for index in range(4):
+        (tmp_path / f"bad{index}.py").write_bytes(b"# coding: ascii\nVALUE = '\xff'\n")
+    monkeypatch.setattr(analyzer, "MAX_LOCAL_SOURCE_FILES", 3)
+    opened = _record_binary_reads(monkeypatch)
+
+    files, complete = analyzer._collect_local_source_bundle(entrypoint)
+
+    assert opened == ["server.py", "bad0.py", "bad1.py"]
+    assert [item["path"] for item in files] == ["server.py"]
+    assert complete is False
+
+
+def test_failed_decode_consumes_read_budget(tmp_path, monkeypatch):
+    entrypoint = tmp_path / "server.py"
+    entrypoint.write_text("import bad, good\n", encoding="utf-8")
+    (tmp_path / "bad.py").write_bytes(b"# coding: ascii\n" + b"\xff" * 200)
+    (tmp_path / "good.py").write_text("VALUE = 1\n", encoding="utf-8")
+    monkeypatch.setattr(analyzer, "MAX_LOCAL_SOURCE_BYTES", 96)
+    opened = _record_binary_reads(monkeypatch)
+
+    files, complete = analyzer._collect_local_source_bundle(entrypoint)
+
+    assert opened == ["server.py", "bad.py"]
+    assert [item["path"] for item in files] == ["server.py"]
+    assert complete is False
+
+
+@pytest.mark.parametrize("prefix", [
+    b"VALUE = 'se\xffcret'\n",
+    b"# coding: ascii\nVALUE = 'se\xffcret'\n",
+    b"# coding: not_a_codec\nVALUE = 1\n",
+])
+def test_truncated_invalid_source_is_not_silently_rewritten(tmp_path, monkeypatch, prefix):
+    entrypoint = tmp_path / "server.py"
+    entrypoint.write_text("import dependency\n", encoding="utf-8")
+    (tmp_path / "dependency.py").write_bytes(prefix + b"#" * 200)
+    monkeypatch.setattr(analyzer, "MAX_LOCAL_SOURCE_BYTES", 96)
+
+    row = _get_registered_source(monkeypatch, tmp_path, entrypoint)
+
+    assert row["status"] == "found"
+    assert row["source_code"] == "import dependency\n"
+    assert [item["path"] for item in row["source_files"]] == ["server.py"]
+    assert row["source_bundle_complete"] is False
+
+
+@pytest.mark.parametrize("encoding,header", [
+    ("utf-8", ""),
+    ("utf-8", "# coding: utf-8\n"),
+    ("shift_jis", "# coding: shift_jis\n"),
+])
+def test_split_trailing_character_preserves_valid_prefix(tmp_path, monkeypatch, encoding, header):
+    entrypoint = tmp_path / "server.py"
+    entry_source = "import dependency\n"
+    entrypoint.write_text(entry_source, encoding="utf-8")
+    prefix = header + "VALUE = '"
+    (tmp_path / "dependency.py").write_bytes((prefix + "日'\n").encode(encoding))
+    # Include the first byte of a multibyte character at the input boundary.
+    limit = len(entry_source.encode()) + len(prefix.encode(encoding)) + 1
+    monkeypatch.setattr(analyzer, "MAX_LOCAL_SOURCE_BYTES", limit)
+
+    row = _get_registered_source(monkeypatch, tmp_path, entrypoint)
+
+    assert row["source_files"][-1]["source_code"] == prefix
+    assert row["source_files"][-1]["truncated"] is True
+    assert row["source_bundle_complete"] is False
+
+
+def test_decode_failure_keeps_later_dependency_when_budget_remains(tmp_path, monkeypatch):
+    entrypoint = tmp_path / "server.py"
+    entrypoint.write_text("import bad, good\n", encoding="utf-8")
+    (tmp_path / "bad.py").write_bytes(b"\xff")
+    (tmp_path / "good.py").write_text("VALUE = 1\n", encoding="utf-8")
+
+    row = _get_registered_source(monkeypatch, tmp_path, entrypoint)
+
+    assert row["status"] == "found"
+    assert [item["path"] for item in row["source_files"]] == ["server.py", "good.py"]
+    assert row["source_bundle_complete"] is False
