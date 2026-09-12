@@ -256,6 +256,13 @@ def _decode_bounded_python_source(raw_source: bytes, max_bytes: int) -> Tuple[st
         return line
 
     encoding, _ = tokenize.detect_encoding(readline)
+    # bytes.decode rejects non-text codecs with LookupError. Use a nonempty
+    # probe because decoding empty bytes can bypass codec validation.
+    try:
+        b"\x00".decode(encoding)
+    except UnicodeError:
+        # A valid text codec may require more than one byte (e.g. UTF-16).
+        pass
     source = codecs.getincrementaldecoder(encoding)().decode(
         raw_source, final=not input_truncated
     )

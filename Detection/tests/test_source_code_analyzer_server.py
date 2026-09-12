@@ -372,3 +372,24 @@ def test_decode_failure_keeps_later_dependency_when_budget_remains(tmp_path, mon
     assert row["status"] == "found"
     assert [item["path"] for item in row["source_files"]] == ["server.py", "good.py"]
     assert row["source_bundle_complete"] is False
+
+
+@pytest.mark.parametrize("encoding", ["rot_13", "base64_codec", "hex_codec"])
+def test_non_text_codec_preserves_entrypoint_and_other_dependencies(
+    tmp_path, monkeypatch, encoding
+):
+    entrypoint = tmp_path / "server.py"
+    entry_source = "import bad, good\n"
+    entrypoint.write_text(entry_source, encoding="utf-8")
+    (tmp_path / "bad.py").write_text(
+        f"# coding: {encoding}\nVALUE = 1\n", encoding="utf-8"
+    )
+    (tmp_path / "good.py").write_text("VALUE = 2\n", encoding="utf-8")
+
+    row = _get_registered_source(monkeypatch, tmp_path, entrypoint)
+
+    assert row["status"] == "found"
+    assert row["source_code"] == entry_source
+    assert [item["path"] for item in row["source_files"]] == ["server.py", "good.py"]
+    assert row["source_files"][1]["source_code"] == "VALUE = 2\n"
+    assert row["source_bundle_complete"] is False
